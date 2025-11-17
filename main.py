@@ -383,7 +383,7 @@ SCALP_TP_SINGLE_PCT   = 0.35
 SCALP_BE_AFTER_PCT    = 0.15
 SCALP_ATR_TRAIL_MULT  = 1.0
 
-# ==== SUPER COUNCIL ENHANCEMENTS ====
+# ===== SUPER COUNCIL ENHANCEMENTS =====
 COUNCIL_AI_MODE = True
 TREND_EARLY_DETECTION = True
 MOMENTUM_ACCELERATION = True
@@ -444,6 +444,24 @@ ADAPTIVE_POSITION_SIZING = True
 VOLATILITY_ADJUSTED_SIZE = True
 DYNAMIC_LEVERAGE = False
 MAX_LEVERAGE = 15
+
+# =============== TRADE MODE CONFIG (SCALP vs TREND) ===============
+TREND_ADX_MIN        = 22      # من أول هنا نعتبر إن فيه ترند محترم
+TREND_DI_SPREAD_MIN  = 8       # فرق +DI/-DI عشان نعتبر الاتجاه واضح
+CHOP_ADX_MAX         = 15      # تحت الرقم ده السوق تذبذب (chop)
+
+RSI_TREND_PERSIST    = 3       # عدد الشمعات اللي RSI يمشي فيها فوق/تحت المتوسط عشان نعتبره ترند
+RSI_NEUTRAL_LOW      = 45      # نطاق الرينج / التذبذب
+RSI_NEUTRAL_HIGH     = 55
+
+# إعدادات إدارة الصفقة بناءً على المود
+SCALP_TP_PCT         = 0.35 / 100    # هدف سكالب محترم يغطي الرسوم
+SCALP_BE_AFTER_PCT   = 0.25 / 100
+SCALP_TRAIL_START_PCT= 0.30 / 100
+
+TREND_TP1_PCT        = 0.80 / 100    # أول هدف في الترند
+TREND_BE_AFTER_PCT   = 0.60 / 100
+TREND_TRAIL_START_PCT= 1.00 / 100
 
 # ===== SNAPSHOT & MARK SYSTEM =====
 GREEN="🟢"; RED="🔴"
@@ -631,6 +649,7 @@ def print_position_snapshot(reason="OPEN", color=None):
         open_f = STATE.get("open",False)
         qty    = STATE.get("qty"); px = STATE.get("entry")
         mode   = STATE.get("mode","trend")
+        mode_why = STATE.get("mode_why", "")
         lev    = globals().get("LEVERAGE",0)
         tp1    = globals().get("TP1_PCT_BASE",0)
         be_a   = globals().get("BREAKEVEN_AFTER",0)
@@ -649,7 +668,11 @@ def print_position_snapshot(reason="OPEN", color=None):
             icon = GREEN if str(color).lower()=="green" else RED
             ccol = FG_G if icon==GREEN else FG_R
 
-        log_i(f"{ccol}{BOLD}{icon} {reason} — POSITION SNAPSHOT{RESET}")
+        # إضافة لون حسب النوع
+        mode_color = FG_Y if mode == "scalp" else FG_M
+        mode_icon = "⚡" if mode == "scalp" else "📈"
+        
+        log_i(f"{mode_color}{BOLD}{mode_icon} {reason} — {mode.upper()} POSITION | {mode_why}{RESET}")
         log_i(f"{BOLD}SIDE:{RESET} {side} | {BOLD}QTY:{RESET} {_fmt(qty)} | {BOLD}ENTRY:{RESET} {_fmt(px)} | "
               f"{BOLD}LEV:{RESET} {lev}× | {BOLD}MODE:{RESET} {mode} | {BOLD}OPEN:{RESET} {open_f}")
         log_i(f"{BOLD}TP1:{RESET} {_pct(tp1)} | {BOLD}BE@:{RESET} {_pct(be_a)} | "
@@ -1157,7 +1180,7 @@ def compute_volume_profile(df, period=20):
 
 def compute_momentum_indicators(df):
     close = df['close'].astype(float)
-    high = df['high'].ast(float)
+    high = df['high'].astype(float)
     low = df['low'].astype(float)
     
     roc = ((close - close.shift(5)) / close.shift(5)) * 100
@@ -1242,6 +1265,92 @@ def rsi_ma_context(df):
         "cross": cross,
         "trendZ": "bull" if persist_bull else ("bear" if persist_bear else "none"),
         "in_chop": in_chop
+    }
+
+# =================== TRADE MODE CLASSIFICATION SYSTEM ===================
+def _sma(series, n):
+    """متوسط متحرك بسيط"""
+    return series.rolling(n, min_periods=1).mean()
+
+def _compute_rsi(close, n=14):
+    """حساب RSI"""
+    delta = close.diff()
+    up = delta.clip(lower=0)
+    down = (-delta).clip(lower=0)
+    roll_up = up.ewm(span=n, adjust=False).mean()
+    roll_down = down.ewm(span=n, adjust=False).mean()
+    rs = roll_up / roll_down.replace(0, 1e-12)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50.0)
+
+def rsi_trend_ctx(df, rsi_len=14, ma_len=9):
+    """تحليل اتجاه RSI"""
+    if len(df) < max(rsi_len, ma_len) + 2:
+        return {"rsi": 50.0, "rsi_ma": 50.0, "trend": "none", "in_chop": True}
+
+    rsi = _compute_rsi(df["close"].astype(float), rsi_len)
+    rsi_ma = _sma(rsi, ma_len)
+
+    above = (rsi > rsi_ma)
+    below = (rsi < rsi_ma)
+    
+    # نتحقق من استمرارية الاتجاه
+    bull = above.tail(RSI_TREND_PERSIST).all() if len(above) >= RSI_TREND_PERSIST else False
+    bear = below.tail(RSI_TREND_PERSIST).all() if len(below) >= RSI_TREND_PERSIST else False
+
+    trend = "bull" if bull else ("bear" if bear else "none")
+    
+    current_rsi = float(rsi.iloc[-1])
+    in_chop = RSI_NEUTRAL_LOW <= current_rsi <= RSI_NEUTRAL_HIGH
+
+    return {
+        "rsi": current_rsi,
+        "rsi_ma": float(rsi_ma.iloc[-1]),
+        "trend": trend,
+        "in_chop": in_chop,
+    }
+
+def classify_trade_mode(df, ind):
+    """
+    يقرر هل الصفقة دي SCALP ولا TREND قبل الدخول.
+    يعتمد على: ADX / DI / RSI / تذبذب السوق.
+    يرجّع dict: {mode: 'scalp'|'trend'|'chop', why: '...'}
+    """
+    adx = safe_get(ind, "adx", 0.0)
+    plus_di = safe_get(ind, "plus_di", 0.0)
+    minus_di = safe_get(ind, "minus_di", 0.0)
+
+    di_spread = abs(plus_di - minus_di)
+
+    rctx = rsi_trend_ctx(df)
+    rsi_trend = rctx["trend"]
+    in_chop = rctx["in_chop"]
+
+    strong_trend = (
+        adx >= TREND_ADX_MIN and
+        di_spread >= TREND_DI_SPREAD_MIN
+    ) or (
+        rsi_trend in ("bull", "bear") and not in_chop
+    )
+
+    # 1) سوق تذبذب → سكالب بس / حذر
+    if adx < CHOP_ADX_MAX or in_chop:
+        return {
+            "mode": "scalp",
+            "why": f"chop_or_low_adx adx={adx:.1f} di_spread={di_spread:.1f} chop={in_chop}"
+        }
+
+    # 2) ترند قوي وواضح
+    if strong_trend:
+        return {
+            "mode": "trend",
+            "why": f"strong_trend adx={adx:.1f} di_spread={di_spread:.1f} rsi_trend={rsi_trend}"
+        }
+
+    # 3) منطقة وسطية → نعتبرها سكالب محسّن
+    return {
+        "mode": "scalp",
+        "why": f"default_scalp adx={adx:.1f} di_spread={di_spread:.1f} rsi_trend={rsi_trend}"
     }
 
 # =================== CANDLES MODULE ===================
@@ -2115,61 +2224,67 @@ def execute_trade_decision(side, price, qty, mode, council_data, gz_data):
 def setup_trade_management(mode):
     if mode == "scalp":
         return {
-            "tp1_pct": SCALP_TP_SINGLE_PCT / 100.0,
-            "be_activate_pct": SCALP_BE_AFTER_PCT / 100.0,
-            "trail_activate_pct": 0.8 / 100.0,
+            "tp1_pct": SCALP_TP_PCT,
+            "be_activate_pct": SCALP_BE_AFTER_PCT,
+            "trail_activate_pct": SCALP_TRAIL_START_PCT,
             "atr_trail_mult": SCALP_ATR_TRAIL_MULT,
             "close_aggression": "high"
         }
     else:
         return {
-            "tp1_pct": TREND_TP1 / 100.0,
-            "be_activate_pct": TREND_BE_AFTER / 100.0,
-            "trail_activate_pct": 1.2 / 100.0,
+            "tp1_pct": TREND_TP1_PCT,
+            "be_activate_pct": TREND_BE_AFTER_PCT,
+            "trail_activate_pct": TREND_TRAIL_START_PCT,
             "atr_trail_mult": TREND_ATR_MULT,
             "close_aggression": "medium"
         }
 
 # =================== ENHANCED TRADE EXECUTION ===================
 def open_market_enhanced(side, qty, price):
-    if qty <= 0: 
-        log_e("skip open (qty<=0)")
+    """نسخة محسنة من فتح الصفقة مع تصنيف الترند/السكالب"""
+    if qty <= 0 or price is None:
+        log_e("❌ invalid qty/price")
         return False
-    
-    df = fetch_ohlcv()
-    snap = emit_snapshots(ex, SYMBOL, df)
-    
-    votes = snap["cv"]
-    mode_data = decide_strategy_mode(df, 
-                                   adx=safe_get(votes["ind"], "adx", 0),
-                                   di_plus=safe_get(votes["ind"], "plus_di", 0),
-                                   di_minus=safe_get(votes["ind"], "minus_di", 0),
-                                   rsi_ctx=rsi_ma_context(df))
-    
-    mode = mode_data["mode"]
-    gz = snap["gz"]
-    
+
+    # نجيب الداتا والمؤشرات قبل التنفيذ
+    df = fetch_ohlcv(limit=200)
+    ind = compute_indicators(df)
+
+    # ✅ هنا نقرر: الصفقة دي ترند ولا سكالب؟
+    mode_info = classify_trade_mode(df, ind)
+    mode = mode_info["mode"]
+    why_mode = mode_info["why"]
+
+    log_i(f"🎛 TRADE MODE DECISION: {mode.upper()} | {why_mode}")
+
+    # إعدادات الإدارة بناءً على المود
     management_config = setup_trade_management(mode)
-    
-    success = execute_trade_decision(side, price, qty, mode, votes, gz)
-    
+
+    # تنفيذ الأوردر
+    success = execute_trade_decision(side, price, qty, mode, 
+                                   council_votes_pro_enhanced(df), 
+                                   golden_zone_check(df, ind))
+
     if success:
         STATE.update({
-            "open": True, 
-            "side": "long" if side=="buy" else "short", 
-            "entry": price,
-            "qty": qty, 
-            "pnl": 0.0, 
-            "bars": 0, 
-            "trail": None, 
-            "breakeven": None,
-            "tp1_done": False, 
-            "highest_profit_pct": 0.0, 
-            "profit_targets_achieved": 0,
-            "mode": mode,
-            "management": management_config
+            "open": True,
+            "side": "long" if side.lower().startswith("b") else "short",
+            "entry": float(price),
+            "qty": float(qty),
+            "pnl": 0.0,
+            "bars": 0,
+            "mode": mode,               # ✅ هنا البوت عرف الصفقة دي نوعها إيه
+            "mode_why": why_mode,       # ✅ وليه اتخذ القرار ده
+            "management": management_config,  # ✅ إعدادات مخصصة للنوع
+            "opened_at": time.time(),
+            "tp1_done": False,
+            "trail_active": False,
+            "breakeven_armed": False,
+            "highest_profit_pct": 0.0,
+            "profit_targets_achieved": 0
         })
-        
+
+        # حفظ السنابشوت
         save_state({
             "in_position": True,
             "side": "LONG" if side.upper().startswith("B") else "SHORT",
@@ -2177,25 +2292,15 @@ def open_market_enhanced(side, qty, price):
             "position_qty": qty,
             "leverage": LEVERAGE,
             "mode": mode,
+            "mode_why": why_mode,
             "management": management_config,
-            "gz_snapshot": gz if isinstance(gz, dict) else {},
-            "cv_snapshot": votes if isinstance(votes, dict) else {},
-            "opened_at": int(time.time()),
-            "partial_taken": False,
-            "breakeven_armed": False,
-            "trail_active": False,
-            "trail_tightened": False,
+            "opened_at": int(time.time())
         })
-        
-        STATE["last_ind"] = votes["ind"] if isinstance(votes,dict) else {}
-        STATE["last_council"] = votes
-        STATE["last_flow"] = compute_flow_metrics(df)
-        STATE["last_spread_bps"] = orderbook_spread_bps()
-        
-        log_g(f"✅ POSITION OPENED: {side.upper()} | mode={mode}")
-        print_position_snapshot(reason="OPEN")
+
+        log_g(f"✅ POSITION OPENED: {side.upper()} | mode={mode} | reason={why_mode}")
+        print_position_snapshot(reason=f"OPEN - {mode.upper()}")
         return True
-    
+
     return False
 
 open_market = open_market_enhanced
@@ -2372,6 +2477,7 @@ def _reset_after_close(reason, prev_side=None):
 
 # =================== ENHANCED TRADE MANAGEMENT ===================
 def manage_after_entry_enhanced(df, ind, info):
+    """إدارة محسنة للصفقات بناءً على نوعها"""
     if not STATE["open"] or STATE["qty"] <= 0:
         return
 
@@ -2379,13 +2485,58 @@ def manage_after_entry_enhanced(df, ind, info):
     entry = STATE["entry"]
     side = STATE["side"]
     qty = STATE["qty"]
-    mode = STATE.get("mode", "trend")
-    
+    mode = STATE.get("mode", "scalp")  # الإفتراضي سكالب
+
+    pnl_pct = (px - entry) / entry * 100 * (1 if side == "long" else -1)
+    STATE["pnl"] = pnl_pct
+
+    if pnl_pct > STATE["highest_profit_pct"]:
+        STATE["highest_profit_pct"] = pnl_pct
+
+    # جلب إعدادات الإدارة من الـSTATE
+    management = STATE.get("management", {})
+    tp_target = management.get("tp1_pct", SCALP_TP_PCT) * 100
+    be_after = management.get("be_activate_pct", SCALP_BE_AFTER_PCT) * 100
+    trail_start = management.get("trail_activate_pct", SCALP_TRAIL_START_PCT) * 100
+
+    # 1) جني ربح أولي
+    if not STATE.get("tp1_done") and pnl_pct >= tp_target:
+        close_qty = safe_qty(STATE["qty"] * 0.3)  # إغلاق 30% عند TP1
+        if close_qty > 0:
+            close_side = "sell" if STATE["side"] == "long" else "buy"
+            if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
+                try:
+                    params = exchange_specific_params(close_side, is_close=True)
+                    ex.create_order(SYMBOL, "market", close_side, close_qty, None, params)
+                    log_g(f"💰 TP1 HIT ({mode}) pnl={pnl_pct:.2f}% | closed 30%")
+                    STATE["profit_targets_achieved"] += 1
+                except Exception as e:
+                    log_e(f"❌ TP1 close failed: {e}")
+            STATE["qty"] = safe_qty(STATE["qty"] - close_qty)
+            STATE["tp1_done"] = True
+
+    # 2) تفعيل نقطة التعادل
+    if not STATE.get("breakeven_armed") and pnl_pct >= be_after:
+        STATE["breakeven_armed"] = True
+        STATE["breakeven"] = entry
+        log_i(f"🛡️ BE ARMED ({mode}) at {pnl_pct:.2f}%")
+
+    # 3) تفعيل الوقف المتحرك
+    if not STATE.get("trail_active") and pnl_pct >= trail_start:
+        STATE["trail_active"] = True
+        log_i(f"📈 TRAIL ACTIVE ({mode}) at {pnl_pct:.2f}%")
+
+    # إدارة متقدمة بناءً على النوع
     if mode == "trend":
         trend_strength = compute_trend_strength(df, ind)
         manage_trend_ride_intelligently(df, ind, info, trend_strength)
     else:
         manage_scalp_trade(df, ind, info)
+
+    # تحديث السجل
+    STATE["bars"] += 1
+
+manage_after_entry = manage_after_entry_enhanced
 
 def manage_scalp_trade(df, ind, info):
     px = info["price"]
@@ -2443,8 +2594,6 @@ def manage_scalp_trailing_stop(current_price, side, ind):
             if (side == "long" and current_price <= STATE["trail"]) or (side == "short" and current_price >= STATE["trail"]):
                 log_w(f"SCALP TRAIL STOP: {current_price} vs trail {STATE['trail']}")
                 close_market_strict("scalp_trailing_stop")
-
-manage_after_entry = manage_after_entry_enhanced
 
 def smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, entry_price, gz=None):
     atr = safe_get(ind, 'atr', 0.0)
