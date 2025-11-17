@@ -19,7 +19,7 @@ import numpy as np
 import ccxt
 from flask import Flask, jsonify
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
-import talib
+
 from scipy import stats
 from dataclasses import dataclass
 from typing import List, Optional
