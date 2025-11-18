@@ -8,6 +8,7 @@ SUI ULTRA PRO AI BOT - الإصدار الذكي المتقدم المتكامل
 • نظام Footprint + Diagonal Order-Flow المتقدم
 • Multi-Exchange Support: BingX & Bybit
 • HQ Trading Intelligence Patch - مناطق ذهبية + SMC + OB/FVG
+• SMART PROFIT AI - نظام جني الأرباح الذكي المتقدم
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -234,6 +235,179 @@ class SignalLogger:
     def get_recent_missed(self, count=10):
         return list(self.missed_signals)[-count:]
 
+# =============================
+#  SMART PROFIT AI - نظام جني الأرباح الذكي
+# =============================
+
+def safe_float_series(df, col):
+    """تحويل أي عمود Float بدون ما يكسر Pandas"""
+    try:
+        return pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+    except:
+        return df[col].astype(float)
+
+def compute_momentum_indicators_safe(df):
+    """نسخة آمنة تماماً من حساب الزخم"""
+    try:
+        if len(df) < 15:
+            return {"rsi": 50.0, "high": 0.0, "low": 0.0, "close": 0.0, "volume": 0.0}
+        
+        high  = safe_float_series(df, "high")
+        low   = safe_float_series(df, "low") 
+        close = safe_float_series(df, "close")
+        vol   = safe_float_series(df, "volume")
+
+        # RSI آمن
+        delta = close.diff()
+        gain = delta.where(delta > 0, 0.0)
+        loss = (-delta).where(delta < 0, 0.0)
+
+        avg_gain = gain.rolling(14, min_periods=1).mean()
+        avg_loss = loss.rolling(14, min_periods=1).mean().replace(0, 0.001)
+
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+
+        return {
+            "rsi": float(rsi.iloc[-1]),
+            "high": float(high.iloc[-1]),
+            "low": float(low.iloc[-1]), 
+            "close": float(close.iloc[-1]),
+            "volume": float(vol.iloc[-1])
+        }
+    except Exception as e:
+        log_w(f"Momentum indicators error: {e}")
+        return {"rsi": 50.0, "high": 0.0, "low": 0.0, "close": 0.0, "volume": 0.0}
+
+def smart_profit_ai(position_side, entry_price, current_price, trend_strength, vol_boost, mode="scalp"):
+    """
+    🧠 نظام جني الأرباح الذكي المتقدم
+    - يحدد تلقائياً إذا كانت الصفقة سكالب أم ترند
+    - يطبق استراتيجية خروج مخصصة لكل نوع
+    - يركب الترند القوي لتحقيق أقصى ربح
+    """
+    
+    if not all([entry_price, current_price]) or entry_price == 0:
+        return "HOLD"
+    
+    profit_pct = ((current_price - entry_price) / entry_price) * 100
+    if position_side.upper() in ["SELL", "SHORT"]:
+        profit_pct = -profit_pct
+
+    # تحديد نمط التداول تلقائياً
+    if mode == "scalp" or trend_strength < 2:
+        # 🔥 إستراتيجية السكالب السريع
+        if profit_pct >= 0.45:
+            return "TAKE_PROFIT_SCALP"
+        elif profit_pct >= 0.25 and vol_boost:
+            return "PARTIAL_PROFIT_25"
+        elif profit_pct <= -0.35:
+            return "STOP_LOSS_SCALP"
+            
+    elif 2 <= trend_strength < 4:
+        # 📈 إستراتيجية الترند المتوسط
+        if profit_pct >= 1.2:
+            return "TAKE_PROFIT_PARTIAL_50"
+        elif profit_pct >= 2.0:
+            return "MOVE_STOP_BREAK_EVEN"
+        elif profit_pct >= 3.0:
+            return "TAKE_PROFIT_PARTIAL_30"
+        elif profit_pct <= -1.5:
+            return "STOP_LOSS_TREND"
+            
+    else:  # trend_strength >= 4
+        # 🚀 إستراتيجية الترند القوي - ركوب الموجة
+        if profit_pct >= 1.0 and not vol_boost:
+            return "HOLD_WAIT_VOLUME"
+        elif profit_pct >= 2.5:
+            return "PARTIAL_PROFIT_20"
+        elif profit_pct >= 4.0 and vol_boost:
+            return "HOLD_TP_STRONG"
+        elif profit_pct >= 6.0:
+            return "FINAL_TP_STRONG"
+        elif profit_pct >= 8.0:
+            return "FULL_EXIT_MAX_PROFIT"
+        elif profit_pct <= -2.0:
+            return "STOP_LOSS_STRONG_TREND"
+
+    return "HOLD"
+
+def apply_smart_profit_strategy():
+    """تطبيق إستراتيجية جني الأرباح على الصفقة الحالية"""
+    if not STATE.get("open") or STATE["qty"] <= 0:
+        return
+        
+    try:
+        current_price = price_now()
+        if not current_price:
+            return
+            
+        # جمع بيانات السوق
+        df = fetch_ohlcv(limit=50)
+        momentum = compute_momentum_indicators_safe(df)
+        volume_profile = compute_volume_profile(df)
+        
+        # حساب قوة الترند
+        trend_strength = 0
+        if safe_get(momentum, 'rsi', 50) > 60:
+            trend_strength += 2
+        if volume_profile.get('volume_spike'):
+            trend_strength += 2
+        if safe_get(STATE, 'pnl', 0) > 1.0:
+            trend_strength += 1
+            
+        vol_boost = volume_profile.get('volume_spike', False)
+        
+        # استشارة الذكاء الاصطناعي لجني الأرباح
+        decision = smart_profit_ai(
+            STATE["side"],
+            STATE["entry"], 
+            current_price,
+            trend_strength,
+            vol_boost,
+            STATE.get("mode", "scalp")
+        )
+        
+        # تنفيذ القرار
+        if decision != "HOLD":
+            log_i(f"🧠 SMART PROFIT AI: {decision}")
+            
+            if "TAKE_PROFIT" in decision or "PARTIAL" in decision:
+                # إغلاق جزئي
+                close_percent = 0.3
+                if "50" in decision:
+                    close_percent = 0.5
+                elif "25" in decision:
+                    close_percent = 0.25
+                elif "20" in decision:
+                    close_percent = 0.2
+                    
+                close_qty = safe_qty(STATE["qty"] * close_percent)
+                if close_qty > 0:
+                    close_side = "sell" if STATE["side"] == "long" else "buy"
+                    if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
+                        try:
+                            params = exchange_specific_params(close_side, is_close=True)
+                            ex.create_order(SYMBOL, "market", close_side, close_qty, None, params)
+                            log_g(f"💰 SMART PARTIAL CLOSE: {close_percent*100}% | Decision: {decision}")
+                            STATE["qty"] = safe_qty(STATE["qty"] - close_qty)
+                        except Exception as e:
+                            log_e(f"❌ Smart partial close failed: {e}")
+                            
+            elif "STOP_LOSS" in decision:
+                close_market_strict(f"Smart Stop Loss: {decision}")
+                
+            elif "MOVE_STOP_BREAK_EVEN" in decision:
+                STATE["breakeven"] = STATE["entry"]
+                STATE["breakeven_armed"] = True
+                log_i("🛡️ MOVED TO BREAKEVEN - Smart Profit AI")
+                
+            elif "FULL_EXIT" in decision:
+                close_market_strict(f"Smart Full Exit: {decision}")
+                
+    except Exception as e:
+        log_w(f"Smart profit strategy error: {e}")
+
 # ---------- Initialize Global Objects ----------
 trend_ctx = SmartTrendContext()
 smc_detector = SMCDetector()
@@ -264,7 +438,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = f"SUI ULTRA PRO AI v7.0 — {EXCHANGE_NAME.upper()}"
+BOT_VERSION = f"SUI ULTRA PRO AI v7.0 — {EXCHANGE_NAME.upper()} - SMART PROFIT AI"
 print("🚀 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -2712,6 +2886,10 @@ def trade_loop_enhanced_with_smart_patch():
                 time.sleep(BASE_SLEEP)
                 continue
                 
+            # ✅ إضافة نظام جني الأرباح الذكي
+            if STATE.get("open") and px:
+                apply_smart_profit_strategy()
+                
             # تحديث جميع المحركات الذكية
             close_prices = df['close'].astype(float).tolist()
             volumes = df['volume'].astype(float).tolist()
@@ -3003,7 +3181,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(safe_get(ind, 'rsi'))}  +DI={fmt(safe_get(ind, 'plus_di'))}  -DI={fmt(safe_get(ind, 'minus_di'))}  ADX={fmt(safe_get(ind, 'adx'))}  ATR={fmt(safe_get(ind, 'atr'))}")
-        print(f"   🎯 ENTRY: SUPER COUNCIL AI + GOLDEN ENTRY + SUPER SCALP |  spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 ENTRY: SUPER COUNCIL AI + GOLDEN ENTRY + SUPER SCALP + SMART PROFIT AI |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         print("\n🧭 POSITION")
         bal_line = f"Balance={fmt(bal,2)}  Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x  CompoundPnL={fmt(compound_pnl)}  Eq~{fmt((bal or 0)+compound_pnl,2)}"
@@ -3035,7 +3213,7 @@ def mark_position(color):
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ SUI ULTRA PRO AI Bot — {EXCHANGE_NAME.upper()} — {SYMBOL} {INTERVAL} — {mode} — Super Council AI + Intelligent Trend Riding"
+    return f"✅ SUI ULTRA PRO AI Bot — {EXCHANGE_NAME.upper()} — {SYMBOL} {INTERVAL} — {mode} — Super Council AI + Intelligent Trend Riding + Smart Profit AI"
 
 @app.route("/metrics")
 def metrics():
@@ -3044,11 +3222,12 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP", "wait_for_next_signal": wait_for_next_signal_side,
+        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT", "wait_for_next_signal": wait_for_next_signal_side,
         "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY},
         "scalp_mode": SCALP_MODE,
         "super_council_ai": COUNCIL_AI_MODE,
-        "intelligent_trend_riding": TREND_RIDING_AI
+        "intelligent_trend_riding": TREND_RIDING_AI,
+        "smart_profit_ai": True
     })
 
 @app.route("/health")
@@ -3057,9 +3236,10 @@ def health():
         "ok": True, "exchange": EXCHANGE_NAME, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP", "wait_for_next_signal": wait_for_next_signal_side,
+        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT", "wait_for_next_signal": wait_for_next_signal_side,
         "scalp_mode": SCALP_MODE,
-        "super_council_ai": COUNCIL_AI_MODE
+        "super_council_ai": COUNCIL_AI_MODE,
+        "smart_profit_ai": True
     }), 200
 
 # ============================================
@@ -3083,6 +3263,11 @@ def smart_stats():
             "consecutive_wins": zero_scalper.consecutive_wins,
             "consecutive_losses": zero_scalper.consecutive_losses,
             "cooldown_until": zero_scalper.cooldown_until
+        },
+        "smart_profit_ai": {
+            "active": True,
+            "version": "2.0",
+            "features": ["scalp_profits", "trend_riding", "volume_analysis"]
         }
     })
 
@@ -3124,7 +3309,8 @@ def verify_execution_environment():
     print(f"🔧 EXCHANGE: {EXCHANGE_NAME.upper()} | SYMBOL: {SYMBOL}", flush=True)
     print(f"🔧 EXECUTE_ORDERS: {EXECUTE_ORDERS} | DRY_RUN: {DRY_RUN}", flush=True)
     print(f"🎯 GOLDEN ENTRY: score={GOLDEN_ENTRY_SCORE} | ADX={GOLDEN_ENTRY_ADX}", flush=True)
-    print(f"🚀 SMART PATCH: OB/FVG + SMC + Golden Zones + Volume Confirmation", flush=True)
+    print(f"🚀 SMART PATCH: OB/FVG + SMC + Golden Zones + Volume Confirmation + SMART PROFIT AI", flush=True)
+    print(f"🧠 SMART PROFIT AI: Scalp + Trend + Volume Analysis Activated", flush=True)
 
 if __name__ == "__main__":
     verify_execution_environment()
@@ -3135,6 +3321,6 @@ if __name__ == "__main__":
     
     log_i(f"🚀 SUI ULTRA PRO AI BOT STARTED - {BOT_VERSION}")
     log_i(f"🎯 SYMBOL: {SYMBOL} | INTERVAL: {INTERVAL} | LEVERAGE: {LEVERAGE}x")
-    log_i(f"💡 SMART PATCH ACTIVATED: Golden Zones + SMC + OB/FVG + Zero Reversal Scalping")
+    log_i(f"💡 SMART PATCH ACTIVATED: Golden Zones + SMC + OB/FVG + Zero Reversal Scalping + SMART PROFIT AI")
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
